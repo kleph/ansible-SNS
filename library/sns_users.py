@@ -115,13 +115,29 @@ class User:
             return False
 
 
-    def create(self):
-        pass
+    def create(self, fwConnection):
+        if not self.given_name:
+            self.given_name = " ".join([w.capitalize() for w in self.uid.replace('.', ' ').split()])
+        name = self.given_name.split()[0]
+        # self.module.fail_json(msg="USER CREATE uid=%s name=%s gname=\"%s\"" % (self.uid, name, self.given_name))
+        response = runCommand(fwConnection, "USER CREATE uid=%s name=%s gname=\"%s\"" % 
+                              (self.uid, name, self.given_name))
+        if response.ret >= 200:
+            self.module.fail_json(msg="error creating user %s" % self.uid, data=response.parser.serialize_data(),
+                                  result=response.output, ret=response.ret)
+            return False
+        return True
     
-    def remove_user(self):
-        pass
+    def remove(self, fwConnection):
+        # self.module.fail_json(msg="USER REMOVE %s % self.uid
+        response = runCommand(fwConnection, "USER REMOVE %s" % self.uid)
+        if response.ret >= 200:
+            self.module.fail_json(msg="error removing user %s" % self.uid, data=response.parser.serialize_data(),
+                                  result=response.output, ret=response.ret)
+            return False
+        return True
     
-    def modify_user(self):
+    def modify(self, fwConnection):
         pass
 
 
@@ -178,6 +194,7 @@ def main():
     uid = module.params['uid']
     state = module.params['state']
     group = module.params['group']
+    given_name = module.params['given_name']
     force_modify = module.params['force_modify']
 
     if uid is None:
@@ -224,28 +241,45 @@ def main():
 
     # user handling
     resultJson=dict(changed=False, original_message='', message='')
-    current_user = User(uid, 'given_name', group, module)
+    current_user = User(uid, given_name, group, module)
 
     if state == 'present':
-      if current_user.exists(client):
-        current_user.setdn(client)
-        if group:
-            if current_user.in_group(client, group):
-                resultJson['changed']=False
-                resultJson['message']="user %s already exists and is in the right group!" % uid
-            else:
+        if not current_user.exists(client):
+            if current_user.create(client):
                 resultJson['changed']=True
-                resultJson['message']="user %s already exists but not in group %s!" % (uid, group)
+                resultJson['message']="user %s created" % uid
+            else: 
+                resultJson['changed']=False
+                resultJson['message']="Error creating user %s" % uid
         else:
-          resultJson['changed']=False
-          resultJson['message']="user %s already exists !" % uid
+            # nothing to do
+            resultJson['changed']=False
+            resultJson['message']="user %s already exists !" % uid
+
+      if group:
+          current_user.setdn(client)
+          if current_user.in_group(client, group):
+              # nothing to do
+              resultJson['changed']=False
+              resultJson['message']="user %s already exists and is in the right group!" % uid
+          else:
+              # assign to the group (create group before ?)
+              resultJson['changed']=True
+              resultJson['message']="user %s already exists but not in group %s!" % (uid, group)
+
+    if state == 'absent':
+      if current_user.exists(client):
+          if current_user.remove(client):
+              resultJson['changed']=True
+              resultJson['message']="user %s removed" % uid
+          else:
+              resultJson['changed']=False
+              resultJson['message']="Error removing user %s" % uid
       else:
-        resultJson['changed']=True
-        resultJson['message']="user %s does not exists !" % uid
+          # nothing to do
+          resultJson['changed']=False
 
-      client.disconnect()
-      module.exit_json(**resultJson)
-
+    client.disconnect()
     module.exit_json(**resultJson)
 
 if __name__ == '__main__':
