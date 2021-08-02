@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ANSIBLE_METADATA = {'metadata_version': '1.0',
+ANSIBLE_METADATA = {'metadata_version': '0.9',
                     'status': ['preview'],
                     'supported_by': 'community'}
 
@@ -23,15 +23,16 @@ DOCUMENTATION = '''
 module: sns_users
 short_description: API client to manipulate users in Stormshield Network Security appliances
 description:
-  TODO: update
   Configuration API reference: https://documentation.stormshield.eu/SNS/v4/en/Content/Basic_Command_Line_Interface_configurations
 options:
   uid:
-    name of the user
-  given_name:
-    optionnal full name (will default to uid if absent)
+    name of the user. Format is supposed to be firstname.lastname. Common Name will try to be "Firstname Lastname".
   group:
     group to which user belongs (TODO: only one for now)
+  pki:
+    optional PKI to create identity from. Format is DN:  "C=, ST=, L=, O=, OU="
+  passphrase:
+    optionnal passphrase to protect certificate's private key(default: temp)
   state:
       description:
           - Whether the account should exist or not, taking action if the state is different from what is stated.
@@ -55,9 +56,10 @@ notes:
 EXAMPLES = '''
 - name: Create a user account
   sns_users:
-    uid: toto
-    given_name: toto tata
+    uid: toto.tata
     group: TotoGroup
+    mail: toto.tata@domain.fr
+    pki: C=FR,ST=France
     state: present
     appliance:
       host: myappliance.local
@@ -77,9 +79,6 @@ Status:
   sample: 'OK'
 '''
 
-import os.path
-import time
-
 from stormshield.sns.sslclient import SSLClient
 from stormshield.sns.configparser import ConfigParser
 
@@ -93,40 +92,72 @@ def runCommand(fwConnection,command):
 
 
 class User:
-    def __init__(self, uid, given_name=None, group=None, module=None):
+    def __init__(self, uid, group=None, mail=None, module=None):
         self.uid = uid
-        self.given_name = given_name
         self.group = group
-        self.module = module  # used to debug ansible module
+        self.module = module  # mostly used to debug ansible module
         self.dn = None
-
-
-    def setdn(self, fwConnection):
-        response = runCommand(fwConnection, "USER SHOW user=%s" % self.uid)
-        data = response.parser.serialize_data()
-        self.dn = data['User']['dn']
+        self.mail = None
+        self.new_mail = mail
+        self.identity = None
+        self.identity_expiration = None
+        self.given_name = " ".join([w.capitalize() for w in self.uid.replace('.', ' ').split()])
 
 
     def exists(self, fwConnection):
         response = runCommand(fwConnection, "USER SHOW user=%s" % self.uid)
         if response.ret == 100:
+            data = response.parser.serialize_data()
+            self.dn = data['User']['dn']  # keep DN for group membership
+            if 'mail' in data['User']:
+                self.mail = data['User']['mail']  # keep mail for identify handling
+
+            if 'Certificate' in data:
+                # an identity exists, save it for later
+                self.identity = data['Certificate']['Subject']
+                self.identity_expiration = data['Certificate']['NotAfter']
             return True
         else:
             return False
 
+    def check_identity(self, fwConnection):
+        """ TODO if identity exists but has expired or is from another PKI
+            handle removal and recreation? """
+        if self.identity:
+            return True
+        else:
+            return False
 
     def create(self, fwConnection):
-        if not self.given_name:
-            self.given_name = " ".join([w.capitalize() for w in self.uid.replace('.', ' ').split()])
-        name = self.given_name.split()[0]
+        firstname = self.given_name.split()[0]
+        lastname = self.given_name.split()[1]
         # self.module.fail_json(msg="USER CREATE uid=%s name=%s gname=\"%s\"" % (self.uid, name, self.given_name))
         response = runCommand(fwConnection, "USER CREATE uid=%s name=%s gname=\"%s\"" % 
-                              (self.uid, name, self.given_name))
+                              (self.uid, firstname, lastname))
         if response.ret >= 200:
             self.module.fail_json(msg="error creating user %s" % self.uid, data=response.parser.serialize_data(),
                                   result=response.output, ret=response.ret)
             return False
         return True
+
+    def create_identity(self, fwConnection, passphrase='temp'):
+        # PKI CERTIFICATE CREATE type="user" cn="Tata Toto" passphrase=***** E="toto.tata@domain.fr"
+        # check email
+        # form given name
+        if self.identity:
+            self.module.fail_json(msg="User %s already have an identity!" % self.uid)
+            return False
+
+        #fwConnection.disconnect()
+        #self.module.fail_json(msg="PKI CERTIFICATE CREATE type=\"user\" cn=\"%s\" passphrase=\"%s\" E=\"%s\"" % (self.given_name, passphrase, self.mail))
+        response = runCommand(fwConnection, "PKI CERTIFICATE CREATE type=\"user\" cn=\"%s\" passphrase=\"%s\" E=\"%s\"" % (self.given_name, passphrase, self.mail) )
+        if response.ret >= 200:
+            # PKI create error
+            self.module.fail_json(msg="Identity creation error!", data=response.parser.serialize_data(), 
+                                  result=response.output, ret=response.ret )
+            return False
+        return True
+ 
     
     def remove(self, fwConnection):
         # self.module.fail_json(msg="USER REMOVE %s % self.uid
@@ -137,8 +168,28 @@ class User:
             return False
         return True
     
-    def modify(self, fwConnection):
-        pass
+
+    def add_mail(self, fwConnection):
+        """ TODO: implement other modifications. Description is safe but mail and uid are probably tricky """
+        if self.mail and self.identity:
+            # cannot modify email for now
+            self.module.fail_json(msg="cannot modify email address for user %s (identity needs to be regenerated)" % self.uid)
+            return False
+
+        # USER UPDATE %s operation=add attribute=mail value=%s % (self.uid, self.mail)
+        if self.mail:
+            operation = 'mod'
+        else:
+            operation = 'add'
+
+        # self.module.fail_json(msg="USER UPDATE user=%s operation=%s attribute=mail value=%s" % (self.uid, operation, self.new_mail))
+        response = runCommand(fwConnection, "USER UPDATE user=%s operation=%s attribute=mail value=%s" %
+                                            (self.uid, operation, self.new_mail))
+        if response.ret >= 200:
+            self.module.fail_json(msg="error update email of user %s" % self.uid, data=response.parser.serialize_data(),
+                                  result=response.output, ret=response.ret)
+            return False
+        return True
 
 
     def group_getmembers(self, fwConnection, groupname):
@@ -163,13 +214,25 @@ class User:
         else:
             return False
 
+    def add_to_group(self, fwConnection, groupname):
+        response = runCommand(fwConnection, "USER GROUP ADDUSER %s %s" % (groupname, self.uid) )
+        if response.ret >= 200:
+            self.module.fail_json(msg="error adding user %s to group %s" % (self.uid, groupname),
+                                   data=response.parser.serialize_data(),
+                                   result=response.output, ret=response.ret)
+            return False
+        return True
+
+
 def main():
     module = AnsibleModule(
         argument_spec={
             "uid": {"required": True, "type": "str"},
-            "given_name": {"required": False, "type": "str"},
+            "email": {"required": False, "type": "str"},
             "state": {"type": "str", "default": "present", "choices": ['absent', 'present']},
             "group": {"required": False, "type": "str"},
+            "pki": {"required": False, "type": "str"},
+            "passphrase": {"required": False, "type": "str"},
             "force_modify": {"required": False, "type":"bool", "default":False},
             "timeout": {"required": False, "type": "int", "default": None},
             "appliance": {
@@ -194,7 +257,9 @@ def main():
     uid = module.params['uid']
     state = module.params['state']
     group = module.params['group']
-    given_name = module.params['given_name']
+    email = module.params['email']
+    pki = module.params['pki']
+    passphrase = module.params['passphrase'].strip()
     force_modify = module.params['force_modify']
 
     if uid is None:
@@ -227,7 +292,7 @@ def main():
     except Exception as exception:
         module.fail_json(msg=str(exception))
 
-    # write privileges handling
+    # acquire write privileges
     if force_modify:
         try:
             response = client.send_command("MODIFY FORCE ON")
@@ -241,7 +306,7 @@ def main():
 
     # user handling
     resultJson=dict(changed=False, original_message='', message='')
-    current_user = User(uid, given_name, group, module)
+    current_user = User(uid, group, email, module)
 
     if state == 'present':
         if not current_user.exists(client):
@@ -254,28 +319,49 @@ def main():
         else:
             # nothing to do
             resultJson['changed']=False
-            resultJson['message']="user %s already exists !" % uid
+            resultJson['message']="user %s already exists!" % uid
 
-      if group:
-          current_user.setdn(client)
-          if current_user.in_group(client, group):
-              # nothing to do
-              resultJson['changed']=False
-              resultJson['message']="user %s already exists and is in the right group!" % uid
-          else:
-              # assign to the group (create group before ?)
-              resultJson['changed']=True
-              resultJson['message']="user %s already exists but not in group %s!" % (uid, group)
+        if group:
+            if current_user.in_group(client, group):
+                # nothing to do
+                resultJson['changed']=False
+                resultJson['message']="user %s already exists and is in the right group!" % uid
+            else:
+                # assign to the group (TODO: create group before ?)
+                current_user.add_to_group(client, group)
+                resultJson['changed']=True
+                resultJson['message']="user %s added to group %s!" % (uid, group)
+
+        if email:
+            if not current_user.mail:
+                current_user.add_mail(client)
+                resultJson['changed']=True
+                resultJson['message']="Add email %s to user %s" % (email, uid)
+
+        if pki:
+            # check identy in user
+            # if not present, create it
+            if current_user.mail:
+                if current_user.create_identity(client, passphrase):
+                    resultJson['changed']=True
+                    resultJson['message']="Identity created for user %s" % uid
+                else:
+                    resultJson['changed']=False
+
+            else:
+                resultJson['changed']=False
+                resultJson['message']="Can't add an identity to a user without email"
+
 
     if state == 'absent':
-      if current_user.exists(client):
-          if current_user.remove(client):
-              resultJson['changed']=True
-              resultJson['message']="user %s removed" % uid
-          else:
-              resultJson['changed']=False
-              resultJson['message']="Error removing user %s" % uid
-      else:
+        if current_user.exists(client):
+            if current_user.remove(client):
+                resultJson['changed']=True
+                resultJson['message']="user %s removed" % uid
+            else:
+                resultJson['changed']=False
+                resultJson['message']="Error removing user %s" % uid
+        else:
           # nothing to do
           resultJson['changed']=False
 
